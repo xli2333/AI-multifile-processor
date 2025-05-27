@@ -1,28 +1,50 @@
 import streamlit as st
-from dotenv import load_dotenv
+# from dotenv import load_dotenv # 在云端不需要 dotenv，可以注释掉或保留用于本地
 import os
 import time
 
 from openai_utils import get_gpt4o_response, generate_initial_analysis_prompt
 from persistence_utils import save_app_state, load_app_state, STATE_FILE
 
-# Page config (should be the first Streamlit command)
+# 页面配置 (应是第一个 Streamlit 命令)
 st.set_page_config(page_title="批量文件智能处理助手", layout="wide", initial_sidebar_state="expanded")
 
-# Load environment variables (API Key)
-load_dotenv()
+# load_dotenv() # 如果使用，确保它只在本地开发时加载
 
-# --- Application State Initialization ---
+# --- 应用状态初始化 ---
 DEFAULT_USER_INSTRUCTION = "请仔细检查以下文本的翻译质量，评估其准确性、流畅性和文化适应性。如果存在不合理之处，请具体指出并提供修改建议。"
 
-if 'app_initialized' not in st.session_state:
-    persisted_state_loaded = load_app_state()
+# 获取API密钥的辅助函数
+def get_configured_api_key():
+    """
+    优先从 Streamlit Secrets 获取 API 密钥。
+    如果 Secrets 中没有，则回退到 session_state 中的 api_key (通常由用户在侧边栏输入)。
+    """
+    try:
+        # 检查是否在 Streamlit Cloud 环境中运行，并且 Secrets 是否已配置
+        # Streamlit Cloud 会自动将 Secrets 注入到 st.secrets 中
+        # 您需要在 Streamlit Cloud 的应用设置中设置一个名为 "OPENAI_API_KEY" 的 Secret
+        if hasattr(st, 'secrets') and "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception: # st.secrets 可能在本地环境中不存在
+        pass
+    
+    # 如果 Secrets 中没有，或者不在云环境中，则使用 session_state 中的 api_key
+    return st.session_state.get("api_key", "")
 
+
+if 'app_initialized' not in st.session_state:
+    # 对于云部署，load_app_state() 读取本地 session_data.json 的方式对于持久化记忆是无效的。
+    # 如果您希望保留本地开发时的加载功能，可以有条件地调用它。
+    if 'streamlit_sharing' not in os.environ: # 仅在本地环境尝试加载
+        persisted_state_loaded = load_app_state()
+
+    # 初始化 session_state 中的 api_key (主要用于本地用户输入)
     if 'api_key' not in st.session_state: 
-        st.session_state.api_key = os.getenv("OPENAI_API_KEY", "")
+        st.session_state.api_key = "" # 初始为空，等待用户输入或从 Secrets 加载
 
     default_values = {
-        'files_data': {},
+        'files_data': {}, # 在云端，这部分数据在会话结束后会丢失
         'current_view': "main_upload",
         'selected_file_for_chat': None,
         'user_general_instruction': DEFAULT_USER_INSTRUCTION,
@@ -34,15 +56,21 @@ if 'app_initialized' not in st.session_state:
     
     st.session_state.app_initialized = True
 
-# --- Sidebar ---
+# --- 侧边栏 ---
 with st.sidebar:
     st.title("⚙️ 设置与导航")
     
+    # API 密钥输入框，主要用于本地测试或当 Secrets 未配置时的备用
+    # 在云端，我们期望 API 密钥通过 st.secrets 提供
     st.text_input(
-        "OpenAI API 密钥", 
+        "OpenAI API 密钥 (若云端已配置Secrets则此处可留空)", 
         type="password", 
-        key="api_key" 
+        key="api_key" # 这个 key 会将输入值存入 st.session_state.api_key
     )
+
+    # 获取当前应该使用的API密钥
+    # 在每次需要使用API密钥的地方调用 get_configured_api_key()
+    # 或者在应用开始时获取一次，并保存在一个变量中（但要注意 session_state 的更新）
 
     if st.button("🏠 返回主上传/结果页", key="home_btn_sidebar"):
         st.session_state.current_view = "main_upload"
@@ -63,13 +91,17 @@ with st.sidebar:
                 st.rerun()
     
     st.markdown("---")
-    if st.button("💾 保存当前状态", key="save_state_btn_sidebar"):
-        save_app_state() 
-        st.success("应用状态已保存！")
+    # “保存当前状态”按钮在云端作用有限，因为文件系统是临时的
+    if st.button("💾 保存当前状态 (云端效果有限)", key="save_state_btn_sidebar"):
+        if 'streamlit_sharing' not in os.environ: # 仅在本地尝试保存到文件
+            save_app_state() 
+            st.success("应用状态已在本地保存！")
+        else:
+            st.info("在云端环境中，状态主要保存在当前会话中，无法持久保存到本地文件。")
 
     st.markdown("---")
     if st.session_state.confirm_clear_history: 
-        st.warning("您确定要清空所有已处理文件的数据和对话历史吗？此操作无法撤销。API密钥将保留。")
+        st.warning("您确定要清空所有已处理文件的数据和对话历史吗？此操作无法撤销。")
         col1, col2 = st.columns(2)
         with col1:
             if st.button("✅ 是，全部清空", type="primary", key="confirm_clear_btn_sidebar"): 
@@ -77,9 +109,10 @@ with st.sidebar:
                 st.session_state.selected_file_for_chat = None
                 st.session_state.current_view = "main_upload"
                 st.session_state.user_general_instruction = DEFAULT_USER_INSTRUCTION 
-                save_app_state() 
+                if 'streamlit_sharing' not in os.environ: # 仅在本地尝试保存空状态
+                    save_app_state() 
                 st.session_state.confirm_clear_history = False 
-                st.success("所有历史记录已清空！应用已重置。")
+                st.success("所有内存中的历史记录已清空！") # 调整提示，强调内存
                 time.sleep(1.5) 
                 st.rerun()
         with col2:
@@ -91,13 +124,16 @@ with st.sidebar:
             st.session_state.confirm_clear_history = True
             st.rerun()
 
-# --- Main Application Logic ---
+# --- 主应用逻辑 ---
 if st.session_state.current_view == "main_upload":
     st.header("📝 批量文件处理与分析")
     st.markdown("上传您的文件，并提供一个通用的处理指令。")
 
-    if not st.session_state.get("api_key"): 
-        st.warning("请在侧边栏输入您的OpenAI API密钥以继续。")
+    # 在操作前获取实际使用的API密钥
+    effective_api_key = get_configured_api_key()
+
+    if not effective_api_key: 
+        st.warning("请在侧边栏输入您的OpenAI API密钥，或确保云端部署已正确配置Secrets。")
     
     current_instruction = st.text_area(
         "通用处理指令:",
@@ -115,7 +151,7 @@ if st.session_state.current_view == "main_upload":
         key="file_uploader_input_main" 
     )
 
-    if st.button("🚀 开始处理上传的文件", disabled=not st.session_state.get("api_key") or not uploaded_files, key="process_files_btn_main"):
+    if st.button("🚀 开始处理上传的文件", disabled=not effective_api_key or not uploaded_files, key="process_files_btn_main"):
         if not st.session_state.user_general_instruction.strip():
             st.error("请输入通用的处理指令！")
         else:
@@ -127,18 +163,11 @@ if st.session_state.current_view == "main_upload":
                 filename = uploaded_file.name
                 try:
                     file_content_bytes = uploaded_file.getvalue()
-                    try:
-                        file_content_str = file_content_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        try:
-                            file_content_str = file_content_bytes.decode("gbk")
-                        except UnicodeDecodeError:
-                            file_content_str = file_content_bytes.decode("latin-1", errors='replace')
-                            st.warning(f"文件 {filename} 使用UTF-8和GBK解码失败，已尝试latin-1解码。")
+                    file_content_str = file_content_bytes.decode("utf-8") # 假设UTF-8，可以添加更多编码尝试
                 except Exception as e:
-                    st.error(f"读取文件 {filename} 时发生错误: {e}")
-                    processing_errors_local[filename] = f"读取错误: {e}"
-                    progress_bar.progress((i + 1) / total_files, text=f"处理中: {filename} (读取错误)")
+                    st.error(f"读取或解码文件 {filename} 时发生错误: {e}")
+                    processing_errors_local[filename] = f"读取/解码错误: {e}"
+                    progress_bar.progress((i + 1) / total_files, text=f"处理中: {filename} (错误)")
                     time.sleep(0.1)
                     continue
 
@@ -146,7 +175,8 @@ if st.session_state.current_view == "main_upload":
                 progress_bar.progress((i + 0.5) / total_files, text=progress_text)
                 initial_prompt_content = generate_initial_analysis_prompt(file_content_str, st.session_state.user_general_instruction)
                 messages_for_api = [{"role": "user", "content": initial_prompt_content}]
-                initial_response = get_gpt4o_response(st.session_state.api_key, messages_for_api)
+                # 使用 effective_api_key 进行API调用
+                initial_response = get_gpt4o_response(effective_api_key, messages_for_api)
 
                 if initial_response:
                     st.session_state.files_data[filename] = {
@@ -173,7 +203,8 @@ if st.session_state.current_view == "main_upload":
                     st.caption(f"- {fname}: {err_msg}")
             
             st.session_state.current_view = "file_results" 
-            save_app_state() 
+            if 'streamlit_sharing' not in os.environ: # 仅在本地尝试保存状态
+                save_app_state() 
             st.rerun() 
 
     st.markdown("---")
@@ -189,11 +220,11 @@ if st.session_state.current_view == "main_upload":
                     file_data_main = st.session_state.files_data[filename_main]
                     safe_filename_display = filename_main.replace('.', '_').replace(' ', '_')
                     with cols[j]:
-                        # st.container KEEPS key because it worked in your test
+                        # st.container 保留 key (根据您之前的测试结果)
                         with st.container(border=True, key=f"overview_container_{safe_filename_display}"):
                             st.markdown(f"**📄 {filename_main}**")
                             st.caption("初步分析摘要:")
-                            # WORKAROUND: Removed 'key' from st.expander
+                            # st.expander 移除 key (根据您之前的测试结果，作为 workaround)
                             with st.expander("查看摘要", expanded=False): 
                                 st.markdown(f"> {file_data_main['initial_response']}")
                             
@@ -217,9 +248,12 @@ elif st.session_state.current_view == "chat_view":
     else:
         file_data_chat = st.session_state.files_data[filename_chat]
         safe_filename_chat = filename_chat.replace('.', '_').replace(' ', '_')
+        
+        # 获取API密钥
+        effective_api_key_chat = get_configured_api_key()
 
         st.subheader(f"💬 与文件 '{filename_chat}' 对话中")
-        # WORKAROUND: Removed 'key' from st.expander
+        # st.expander 移除 key (根据您之前的测试结果，作为 workaround)
         with st.expander("原始文件内容 (点击展开/折叠)"): 
             st.text_area("Content", file_data_chat.get('content_str', '无内容'), height=200, disabled=True, key=f"orig_content_text_{safe_filename_chat}")
         
@@ -227,10 +261,10 @@ elif st.session_state.current_view == "chat_view":
         st.markdown("##### 对话历史")
         
         chat_container_height = st.sidebar.slider("调整对话框高度:", 200, 800, 400, 50, key=f"chat_height_slider_chatview_{safe_filename_chat}")
-        # st.container KEEPS key because it worked in your test
+        # st.container 保留 key (根据您之前的测试结果)
         with st.container(height=chat_container_height, key=f"chat_display_container_chatview_{safe_filename_chat}"): 
             for i_msg, message in enumerate(file_data_chat["chat_history"]): 
-                # WORKAROUND: Removed 'key' from st.chat_message. This is NOT ideal for chat lists.
+                # st.chat_message 移除 key (根据您之前的测试结果，作为 workaround，可能影响渲染稳定性)
                 with st.chat_message(message["role"]): 
                     if message["role"] == "user" and i_msg == 0:
                         display_content = (
@@ -245,15 +279,18 @@ elif st.session_state.current_view == "chat_view":
         user_chat_input = st.chat_input(f"就 '{filename_chat}' 继续提问...", key=f"chat_input_chatview_{safe_filename_chat}")
 
         if user_chat_input:
-            if not st.session_state.get("api_key"): 
-                st.warning("请输入API密钥后才能发送消息。")
+            if not effective_api_key_chat: 
+                st.warning("请输入API密钥后才能发送消息，或确保云端部署已正确配置Secrets。")
             else:
                 file_data_chat["chat_history"].append({"role": "user", "content": user_chat_input})
                 messages_for_api = file_data_chat["chat_history"]
-                ai_response = get_gpt4o_response(st.session_state.api_key, messages_for_api)
+                # 使用 effective_api_key_chat 进行API调用
+                ai_response = get_gpt4o_response(effective_api_key_chat, messages_for_api)
                 if ai_response:
                     file_data_chat["chat_history"].append({"role": "assistant", "content": ai_response})
                 else:
                     file_data_chat["chat_history"].append({"role": "assistant", "content": "抱歉，我暂时无法回复。"})
-                save_app_state() 
+                
+                if 'streamlit_sharing' not in os.environ: # 仅在本地尝试保存状态
+                    save_app_state() 
                 st.rerun()
